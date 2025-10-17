@@ -32,14 +32,6 @@ if (fs.existsSync(batchLogsFile)) {
   }
 }
 
-const GPS_THRESHOLD = 0.00005; // ~5 meters
-
-function hasLocationChanged(oldLoc, newLoc) {
-  if (!oldLoc || !newLoc) return true;
-  return Math.abs(oldLoc.lat - newLoc.lat) > GPS_THRESHOLD ||
-         Math.abs(oldLoc.lng - newLoc.lng) > GPS_THRESHOLD;
-}
-
 // Batch push logs every 2 seconds
 setInterval(async () => {
   const logsRef = db.ref("logs");
@@ -58,7 +50,7 @@ setInterval(async () => {
 app.get("/", (_, res) => res.send("IoT Bus RTDB Backend is live 🚀"));
 
 app.post("/rfid-scan", async (req, res) => {
-  const { tagId, readerUsername, location, speed, emergency } = req.body;
+  const { tagId, readerUsername, location, speed, emergency, heading, altitude, satellites, accuracy, fixQuality } = req.body;
   if (!readerUsername) return res.status(400).json({ error: "Missing readerUsername" });
 
   try {
@@ -74,45 +66,35 @@ app.post("/rfid-scan", async (req, res) => {
     let busKey, busData;
     busesSnap.forEach(snap => { busKey = snap.key; busData = snap.val(); });
 
-    const lastState = lastBusState[readerUsername] || {};
-    const locationChanged = hasLocationChanged(lastState, location);
-
-    // Only proceed if meaningful update exists
-    if (!tagId && !locationChanged && emergency !== true) {
-      return res.status(200).json({ message: "No update needed" });
-    }
-
     const updates = {};
+    const timestamp = Date.now();
 
-    // Update bus location only if changed
-    if (locationChanged && location) {
+    // ----- GPS Update -----
+    if (location) {
+      // Convert speed from km/h to m/s
+      const speedMs = speed ? (speed / 3.6) : 0;
+
       updates[`buses/${busKey}/latitude`] = location.lat;
       updates[`buses/${busKey}/longitude`] = location.lng;
 
       lastBusState[readerUsername] = { lat: location.lat, lng: location.lng };
 
-      const timestamp = Date.now();
       const locData = {
         latitude: location.lat,
         longitude: location.lng,
-        altitude: location.altitude || null,
-        speed: speed || 0,
-        heading: location.heading || null,
+        altitude: altitude || null,
+        speed: speedMs,
+        heading: heading || null,
         timestamp,
-        satellites: location.satellites || null,
-        accuracy: location.accuracy || null,
-        fixQuality: location.fixQuality || null
-      };
-      updates[`busLocations/${busKey}/current`] = locData;
-      updates[`busLocations/${busKey}/history/${timestamp}`] = {
-        latitude: location.lat,
-        longitude: location.lng,
-        speed: speed || 0,
-        heading: location.heading || null,
-        timestamp
+        satellites: satellites || null,
+        accuracy: accuracy || null,
+        fixQuality: fixQuality || null
       };
 
-      // Async pruning
+      updates[`busLocations/${busKey}/current`] = locData;
+      updates[`busLocations/${busKey}/history/${timestamp}`] = locData;
+
+      // Async pruning of old history
       (async () => {
         try {
           const HISTORY_LIMIT = 500;
@@ -132,19 +114,18 @@ app.post("/rfid-scan", async (req, res) => {
       })();
     }
 
-    // Emergency updates go separately
+    // ----- Emergency Update -----
     if (emergency === true) {
       await emergencyRef.child(readerUsername).set({
         readerUsername,
         location: location || null,
         emergency: true,
-        timestamp: Date.now()
+        timestamp
       });
     }
 
-    // Handle student/driver tag scans
+    // ----- RFID Handling -----
     if (tagId) {
-      const timestamp = Date.now();
       let logData = {
         busId: busKey,
         busName: busData.plateNumber || "",
@@ -201,7 +182,7 @@ app.post("/rfid-scan", async (req, res) => {
       batchLogs[busKey].push(logData);
     }
 
-    // Apply updates atomically if any
+    // ----- Apply Updates -----
     if (Object.keys(updates).length > 0) {
       await db.ref().update(updates);
     }
