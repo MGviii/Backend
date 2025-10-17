@@ -18,7 +18,7 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-const lastBusState = {}; // { [readerUsername]: { lat, lng, speed, emergency } }
+const lastBusState = {}; // { [readerUsername]: { lat, lng } }
 const batchLogsFile = path.join(__dirname, "batchLogs.json");
 let batchLogs = {};
 
@@ -40,7 +40,7 @@ function hasLocationChanged(oldLoc, newLoc) {
          Math.abs(oldLoc.lng - newLoc.lng) > GPS_THRESHOLD;
 }
 
-// Batch push logs every 2 seconds (reduced file writes)
+// Batch push logs every 2 seconds
 setInterval(async () => {
   const logsRef = db.ref("logs");
   for (const busKey in batchLogs) {
@@ -66,6 +66,7 @@ app.post("/rfid-scan", async (req, res) => {
     const studentsRef = db.ref("students");
     const driversRef = db.ref("drivers");
     const busLocationsRef = db.ref("busLocations");
+    const emergencyRef = db.ref("Emergency");
 
     const busesSnap = await busesRef.orderByChild("rfidReaderUsername").equalTo(readerUsername).once("value");
     if (!busesSnap.exists()) return res.status(404).json({ error: "Bus not found" });
@@ -75,30 +76,22 @@ app.post("/rfid-scan", async (req, res) => {
 
     const lastState = lastBusState[readerUsername] || {};
     const locationChanged = hasLocationChanged(lastState, location);
-    const speedChanged = lastState.speed !== speed;
-    const emergencyChanged = lastState.emergency !== emergency;
 
-    if (!(tagId || locationChanged || speedChanged || emergencyChanged))
+    // Only proceed if meaningful update exists
+    if (!tagId && !locationChanged && emergency !== true) {
       return res.status(200).json({ message: "No update needed" });
+    }
 
-    // Prepare multi-node update
     const updates = {};
+
+    // Update bus location only if changed
     if (locationChanged && location) {
       updates[`buses/${busKey}/latitude`] = location.lat;
       updates[`buses/${busKey}/longitude`] = location.lng;
-    }
-    if (speedChanged && typeof speed === "number") updates[`buses/${busKey}/speed`] = speed;
-    if (emergencyChanged && typeof emergency === "boolean") updates[`buses/${busKey}/emergency`] = emergency;
 
-    lastBusState[readerUsername] = {
-      lat: location?.lat,
-      lng: location?.lng,
-      speed,
-      emergency
-    };
+      lastBusState[readerUsername] = { lat: location.lat, lng: location.lng };
 
-    const timestamp = Date.now();
-    if (location) {
+      const timestamp = Date.now();
       const locData = {
         latitude: location.lat,
         longitude: location.lng,
@@ -129,7 +122,6 @@ app.post("/rfid-scan", async (req, res) => {
           const historyData = historySnap.val() || {};
           const timestamps = Object.keys(historyData).sort((a, b) => a - b);
           const pruneUpdates = {};
-
           for (const ts of timestamps) if (Number(ts) < cutoff) pruneUpdates[ts] = null;
           if (timestamps.length > HISTORY_LIMIT) {
             timestamps.slice(0, timestamps.length - HISTORY_LIMIT).forEach(t => pruneUpdates[t] = null);
@@ -140,22 +132,31 @@ app.post("/rfid-scan", async (req, res) => {
       })();
     }
 
-    // Handle tagId (student/driver)
-    let logData = {
-      busId: busKey,
-      busName: busData.plateNumber || "",
-      driverName: busData.driverName || "",
-      driverPhone: busData.driverPhone || "",
-      tagId: tagId || null,
-      status: null,
-      studentName: null,
-      timestamp,
-      location: location || null,
-      speed: speed || 0,
-      emergency: emergency || false
-    };
+    // Emergency updates go separately
+    if (emergency === true) {
+      await emergencyRef.child(readerUsername).set({
+        readerUsername,
+        location: location || null,
+        emergency: true,
+        timestamp: Date.now()
+      });
+    }
 
+    // Handle student/driver tag scans
     if (tagId) {
+      const timestamp = Date.now();
+      let logData = {
+        busId: busKey,
+        busName: busData.plateNumber || "",
+        driverName: busData.driverName || "",
+        driverPhone: busData.driverPhone || "",
+        tagId,
+        status: null,
+        studentName: null,
+        timestamp,
+        location: location || null
+      };
+
       const [studentsSnap, driversSnap] = await Promise.all([
         studentsRef.orderByChild("studentId").equalTo(tagId).once("value"),
         driversRef.orderByChild("driverId").equalTo(tagId).once("value")
@@ -194,14 +195,16 @@ app.post("/rfid-scan", async (req, res) => {
         logData.driverPhone = driverData.phone || "";
 
       } else return res.status(404).json({ error: "Tag not recognized" });
+
+      // Batch logs
+      if (!batchLogs[busKey]) batchLogs[busKey] = [];
+      batchLogs[busKey].push(logData);
     }
 
-    // Apply all updates atomically
-    await db.ref().update(updates);
-
-    // Batch logs
-    if (!batchLogs[busKey]) batchLogs[busKey] = [];
-    batchLogs[busKey].push(logData);
+    // Apply updates atomically if any
+    if (Object.keys(updates).length > 0) {
+      await db.ref().update(updates);
+    }
 
     res.status(200).json({ message: "Update processed successfully" });
 
