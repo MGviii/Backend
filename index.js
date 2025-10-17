@@ -142,7 +142,7 @@ app.post("/rfid-scan", async (req, res) => {
           const speed_kmh = speed || 0;
 
           try {
-            const etaResp = await axios.post(process.env.ETA_SERVICE_URL || "http://localhost:8000/predict_eta", { distance_km, speed_kmh, status: newStatus === "check-in" ? 1 : 0 });
+            const etaResp = await axios.post(process.env.ETA_SERVICE_URL || "https://eta-service.onrender.com/predict_eta", { distance_km, speed_kmh, status: newStatus === "check-in" ? 1 : 0 });
             eta_minutes = etaResp.data.eta_minutes;
             updates[`students/${studentKey}/eta`] = eta_minutes;
           } catch (err) { console.error("ETA service error:", err.message); }
