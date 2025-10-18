@@ -4,8 +4,6 @@ const bodyParser = require("body-parser");
 const admin = require("firebase-admin");
 const fs = require("fs");
 const path = require("path");
-const axios = require("axios");
-const geolib = require("geolib");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
 
@@ -93,12 +91,10 @@ app.post("/rfid-scan", async (req, res) => {
 
     const updates = {};
     const timestamp = Date.now();
-    let eta_minutes = null;
 
     // Determine GPS coordinates
     const lat = Latitude || (location && location.lat);
     const lng = Longitude || (location && location.lng);
-    const speedMs = Speed ? Speed / 3.6 : 0;
 
     // Update bus locations if GPS is present
     if (lat != null && lng != null) {
@@ -187,33 +183,6 @@ app.post("/rfid-scan", async (req, res) => {
         updates[`students/${studentKey}/lastStatus`] = newStatus;
         updates[`students/${studentKey}/lastBusId`] = busKey;
 
-        // ✅ Call ETA only if useful
-        if (
-          lat != null && lng != null &&
-          lastBusState[readerUsername] &&
-          newStatus // valid check-in/out
-        ) {
-          const busLoc = lastBusState[readerUsername];
-          const distance_m = geolib.getDistance(
-            { latitude: busLoc.lat, longitude: busLoc.lng },
-            { latitude: lat, longitude: lng }
-          );
-          const distance_km = distance_m / 1000;
-          const speed_kmh = Speed || 0;
-
-          try {
-            const etaResp = await axios.post(process.env.ETA_SERVICE_URL || "https://eta-service.onrender.com/predict_eta", {
-              distance_km,
-              speed_kmh,
-              status: newStatus === "check-in" ? 1 : 0
-            });
-            eta_minutes = etaResp.data.eta_minutes;
-            updates[`students/${studentKey}/eta`] = eta_minutes;
-          } catch (err) {
-            console.error("ETA service error:", err.message);
-          }
-        }
-
       } else if (driversSnap.exists()) {
         let driverKey, driverData;
         driversSnap.forEach(snap => { driverKey = snap.key; driverData = snap.val(); });
@@ -234,7 +203,7 @@ app.post("/rfid-scan", async (req, res) => {
     // Push updates to Firebase
     if (Object.keys(updates).length > 0) await db.ref().update(updates);
 
-    res.status(200).json({ message: "RFID/GPS scan processed ✅", eta_minutes });
+    res.status(200).json({ message: "RFID/GPS scan processed ✅" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });
