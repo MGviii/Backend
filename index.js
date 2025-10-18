@@ -5,6 +5,7 @@ const admin = require("firebase-admin");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
+const geolib = require("geolib");
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
 
@@ -59,10 +60,24 @@ app.get("/", (_, res) => res.send("IoT Bus RTDB Backend is live 🚀"));
 
 // RFID scan endpoint
 app.post("/rfid-scan", async (req, res) => {
-  const { tagId, readerUsername, location, speed, emergency, heading, altitude, satellites, accuracy, fixQuality } = req.body;
-  if (!readerUsername) return res.status(400).json({ error: "Missing readerUsername" });
-
   try {
+    const {
+      tagId,
+      readerUsername,
+      emergency,
+      location,
+      Latitude,
+      Longitude,
+      Altitude,
+      Speed,
+      Heading,
+      Satellites,
+      Date: dateStr,
+      "Time (UTC)": timeStr
+    } = req.body;
+
+    if (!readerUsername) return res.status(400).json({ error: "Missing readerUsername" });
+
     const busesRef = db.ref("buses");
     const studentsRef = db.ref("students");
     const driversRef = db.ref("drivers");
@@ -80,14 +95,27 @@ app.post("/rfid-scan", async (req, res) => {
     const timestamp = Date.now();
     let eta_minutes = null;
 
-    // GPS update
-    if (location) {
-      const speedMs = speed ? speed / 3.6 : 0;
-      updates[`buses/${busKey}/latitude`] = location.lat;
-      updates[`buses/${busKey}/longitude`] = location.lng;
-      lastBusState[readerUsername] = { lat: location.lat, lng: location.lng };
+    // Determine GPS coordinates
+    const lat = Latitude || (location && location.lat);
+    const lng = Longitude || (location && location.lng);
+    const speedMs = Speed ? Speed / 3.6 : 0;
 
-      const locData = { latitude: location.lat, longitude: location.lng, altitude: altitude || null, speed: speedMs, heading: heading || null, timestamp, satellites: satellites || null, accuracy: accuracy || null, fixQuality: fixQuality || null };
+    // Update bus locations if GPS is present
+    if (lat != null && lng != null) {
+      lastBusState[readerUsername] = { lat, lng };
+
+      const locData = {
+        Latitude: lat,
+        Longitude: lng,
+        Altitude: Altitude || null,
+        Speed: Speed || 0,
+        Heading: Heading || null,
+        Satellites: Satellites || null,
+        Date: dateStr || null,
+        "Time (UTC)": timeStr || null,
+        timestamp
+      };
+
       updates[`busLocations/${busKey}/current`] = locData;
       updates[`busLocations/${busKey}/history/${timestamp}`] = locData;
 
@@ -108,15 +136,42 @@ app.post("/rfid-scan", async (req, res) => {
       })();
     }
 
-    // Emergency
-    if (emergency === true) {
-      await emergencyRef.child(readerUsername).set({ readerUsername, location: location || null, emergency: true, timestamp });
+    // Emergency handling
+    if (emergency === true && lat != null && lng != null) {
+      await emergencyRef.child(readerUsername).set({
+        readerUsername,
+        emergency: true,
+        location: { lat, lng },
+        timestamp
+      });
     }
 
-    // RFID Handling
+    // RFID / Tag handling
     if (tagId) {
-      let logData = { busId: busKey, busName: busData.plateNumber || "", driverName: busData.driverName || "", driverPhone: busData.driverPhone || "", tagId, status: null, studentName: null, timestamp, location: location || null };
-      const [studentsSnap, driversSnap] = await Promise.all([ studentsRef.orderByChild("studentId").equalTo(tagId).once("value"), driversRef.orderByChild("driverId").equalTo(tagId).once("value") ]);
+      let logData = {
+        busId: busKey,
+        busName: busData.plateNumber || "",
+        driverName: busData.driverName || "",
+        driverPhone: busData.driverPhone || "",
+        tagId,
+        status: null,
+        studentName: null,
+        timestamp,
+        location: { lat, lng },
+        Latitude: lat,
+        Longitude: lng,
+        Altitude: Altitude || null,
+        Speed: Speed || 0,
+        Heading: Heading || null,
+        Satellites: Satellites || null,
+        Date: dateStr || null,
+        "Time (UTC)": timeStr || null
+      };
+
+      const [studentsSnap, driversSnap] = await Promise.all([
+        studentsRef.orderByChild("studentId").equalTo(tagId).once("value"),
+        driversRef.orderByChild("driverId").equalTo(tagId).once("value")
+      ]);
 
       if (studentsSnap.exists()) {
         let studentKey, studentData;
@@ -125,28 +180,40 @@ app.post("/rfid-scan", async (req, res) => {
         const lastBusId = studentData.lastBusId || null;
         const lastStatus = studentData.lastStatus || "check-out";
         let newStatus = (lastStatus === "check-in" && lastBusId === busKey) ? "check-out" : (lastStatus === "check-in") ? null : "check-in";
-        if (!newStatus) return res.status(400).json({ error: "Student is already checked in on another bus", studentId: tagId, lastBusId });
+        if (!newStatus) return res.status(400).json({ error: "Student already checked in on another bus", studentId: tagId, lastBusId });
 
         logData.studentName = studentData.name || "";
         logData.status = newStatus;
         updates[`students/${studentKey}/lastStatus`] = newStatus;
         updates[`students/${studentKey}/lastBusId`] = busKey;
 
-        // -------------------------------
-        // ETA Integration
-        // -------------------------------
-        if (location && lastBusState[readerUsername]) {
+        // ✅ Call ETA only if useful
+        if (
+          lat != null && lng != null &&
+          lastBusState[readerUsername] &&
+          newStatus // valid check-in/out
+        ) {
           const busLoc = lastBusState[readerUsername];
-          const distance_m = require("geolib").getDistance({ latitude: busLoc.lat, longitude: busLoc.lng }, { latitude: location.lat, longitude: location.lng });
+          const distance_m = geolib.getDistance(
+            { latitude: busLoc.lat, longitude: busLoc.lng },
+            { latitude: lat, longitude: lng }
+          );
           const distance_km = distance_m / 1000;
-          const speed_kmh = speed || 0;
+          const speed_kmh = Speed || 0;
 
           try {
-            const etaResp = await axios.post(process.env.ETA_SERVICE_URL || "https://eta-service.onrender.com/predict_eta", { distance_km, speed_kmh, status: newStatus === "check-in" ? 1 : 0 });
+            const etaResp = await axios.post(process.env.ETA_SERVICE_URL || "https://eta-service.onrender.com/predict_eta", {
+              distance_km,
+              speed_kmh,
+              status: newStatus === "check-in" ? 1 : 0
+            });
             eta_minutes = etaResp.data.eta_minutes;
             updates[`students/${studentKey}/eta`] = eta_minutes;
-          } catch (err) { console.error("ETA service error:", err.message); }
+          } catch (err) {
+            console.error("ETA service error:", err.message);
+          }
         }
+
       } else if (driversSnap.exists()) {
         let driverKey, driverData;
         driversSnap.forEach(snap => { driverKey = snap.key; driverData = snap.val(); });
@@ -156,15 +223,18 @@ app.post("/rfid-scan", async (req, res) => {
         updates[`drivers/${driverKey}/currentBusReaderUsername`] = readerUsername;
         logData.driverName = driverData.name || "";
         logData.driverPhone = driverData.phone || "";
-      } else return res.status(404).json({ error: "Tag not recognized" });
+      } else {
+        return res.status(404).json({ error: "Tag not recognized" });
+      }
 
       if (!batchLogs[busKey]) batchLogs[busKey] = [];
       batchLogs[busKey].push(logData);
     }
 
+    // Push updates to Firebase
     if (Object.keys(updates).length > 0) await db.ref().update(updates);
 
-    res.status(200).json({ message: "RFID scan processed ✅", eta_minutes });
+    res.status(200).json({ message: "RFID/GPS scan processed ✅", eta_minutes });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });
