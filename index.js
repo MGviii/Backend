@@ -4,6 +4,7 @@ const bodyParser = require("body-parser");
 const admin = require("firebase-admin");
 const fs = require("fs");
 const path = require("path");
+const axios = require("axios"); // for calling Flask ETA API
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY);
 
@@ -59,6 +60,7 @@ setInterval(async () => {
 // Health check
 app.get("/", (_, res) => res.send("IoT Bus RTDB Backend is live 🚀"));
 
+// --- RFID / GPS Scan Endpoint ---
 app.post("/rfid-scan", async (req, res) => {
   try {
     const {
@@ -102,7 +104,7 @@ app.post("/rfid-scan", async (req, res) => {
 
     // Update busLocations
     if (lat != null && lng != null) {
-      lastBusState[readerUsername] = { lat, lng };
+      lastBusState[readerUsername] = { lat, lng, speed: Speed || 0, heading: Heading || 0 };
       const locData = {
         Latitude: lat,
         Longitude: lng,
@@ -160,6 +162,8 @@ app.post("/rfid-scan", async (req, res) => {
         logData.status = newStatus;
         updates[`students/${studentKey}/lastStatus`] = newStatus;
         updates[`students/${studentKey}/lastBusId`] = busKey;
+        updates[`students/${studentKey}/lastLat`] = lat;
+        updates[`students/${studentKey}/lastLng`] = lng;
 
       } else if (driversSnap.exists()) {
         let driverKey, driverData;
@@ -189,6 +193,76 @@ app.post("/rfid-scan", async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// --- Real-time ETA updates ---
+const ETA_INTERVAL_MS = 5000; // every 5 seconds
+setInterval(async () => {
+  try {
+    for (const readerUsername in lastBusState) {
+      const busLoc = lastBusState[readerUsername];
+      if (!busLoc) continue;
+
+      // Find busKey
+      const busesSnap = await db.ref("buses").orderByChild("rfidReaderUsername").equalTo(readerUsername).once("value");
+      if (!busesSnap.exists()) continue;
+
+      let busKey;
+      busesSnap.forEach(snap => { busKey = snap.key; });
+
+      // Get all students currently assigned to this bus
+      const allStudentsSnap = await db.ref("students").once("value");
+      const students = [];
+      allStudentsSnap.forEach(snap => {
+        const s = snap.val();
+        if (s.lastBusId === busKey) {
+          students.push({
+            studentId: s.studentId,
+            lastLat: s.lastLat || s.homeLat || 0,
+            lastLng: s.lastLng || s.homeLng || 0,
+            lastStatus: s.lastStatus || "check-in"
+          });
+        }
+      });
+
+      if (students.length === 0) continue;
+
+      // Call Flask ETA API
+      const etaResults = await getETA(busLoc.lat, busLoc.lng, busLoc.speed, busLoc.heading, students);
+
+      // Write ETAs back to Firebase
+      for (const sid in etaResults) {
+        const eta = etaResults[sid];
+        const studentSnap = await db.ref("students").orderByChild("studentId").equalTo(sid).once("value");
+        if (studentSnap.exists()) {
+          let studentKey;
+          studentSnap.forEach(snap => { studentKey = snap.key; });
+          await db.ref(`students/${studentKey}/ETA`).set(eta);
+        }
+      }
+
+      console.log(`Updated ETAs for bus ${busKey}`);
+    }
+  } catch (err) {
+    console.error("Error updating real-time ETAs:", err.message);
+  }
+}, ETA_INTERVAL_MS);
+
+// --- Function to call Flask ETA API ---
+async function getETA(busLat, busLng, speed, heading, students) {
+  try {
+    const response = await axios.post(`${process.env.FLASK_ETA_API}/predict`, {
+      busLat,
+      busLng,
+      speed,
+      heading,
+      students
+    });
+    return response.data; // { studentId: ETA_in_sec, ... }
+  } catch (err) {
+    console.error("Flask ETA API error:", err.message);
+    return {};
+  }
+}
 
 // Start server
 const PORT = process.env.PORT || 8080;
