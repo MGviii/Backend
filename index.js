@@ -64,6 +64,7 @@ app.get("/", (_, res) => res.send("IoT Bus RTDB Backend is live 🚀"));
 app.post("/rfid-scan", async (req, res) => {
   try {
     const {
+      eventType,
       tagId,
       readerUsername,
       emergency,
@@ -99,7 +100,7 @@ app.post("/rfid-scan", async (req, res) => {
     const updates = {};
     const timestamp = Date.now();
 
-    // Option 2: always update RFID/emergency even if GPS invalid
+    // Use coordinates or default to 0
     const lat = Latitude || (location && location.lat) || 0;
     const lng = Longitude || (location && location.lng) || 0;
 
@@ -115,10 +116,17 @@ app.post("/rfid-scan", async (req, res) => {
       timestamp
     };
 
-    if (tagId || emergency === true) {
+    // --- Decide when to update ---
+    if (eventType === "RFID" || eventType === "EMERGENCY") {
       updates[`busLocations/${busKey}/current`] = locData;
       updates[`busLocations/${busKey}/history/${timestamp}`] = locData;
-      console.log(`Updated bus location for ${busKey} (RFID or Emergency)`);
+      console.log(`Updated bus location for ${busKey} (${eventType})`);
+    }
+
+    if (eventType === "GPS_UPDATE" && lat !== 0 && lng !== 0) {
+      updates[`busLocations/${busKey}/current`] = locData;
+      updates[`busLocations/${busKey}/history/${timestamp}`] = locData;
+      console.log(`Updated bus location for ${busKey} (GPS)`);
     }
 
     // Emergency handling
@@ -201,14 +209,12 @@ setInterval(async () => {
       const busLoc = lastBusState[readerUsername];
       if (!busLoc) continue;
 
-      // Find busKey
       const busesSnap = await db.ref("buses").orderByChild("rfidReaderUsername").equalTo(readerUsername).once("value");
       if (!busesSnap.exists()) continue;
 
       let busKey;
       busesSnap.forEach(snap => { busKey = snap.key; });
 
-      // Get all students currently assigned to this bus
       const allStudentsSnap = await db.ref("students").once("value");
       const students = [];
       allStudentsSnap.forEach(snap => {
@@ -225,10 +231,8 @@ setInterval(async () => {
 
       if (students.length === 0) continue;
 
-      // Call Flask ETA API
       const etaResults = await getETA(busLoc.lat, busLoc.lng, busLoc.speed, busLoc.heading, students);
 
-      // Write ETAs back to Firebase
       for (const sid in etaResults) {
         const eta = etaResults[sid];
         const studentSnap = await db.ref("students").orderByChild("studentId").equalTo(sid).once("value");
