@@ -99,31 +99,30 @@ app.post("/rfid-scan", async (req, res) => {
     const updates = {};
     const timestamp = Date.now();
 
-    const lat = Latitude || (location && location.lat);
-    const lng = Longitude || (location && location.lng);
+    // Option 2: always update RFID/emergency even if GPS invalid
+    const lat = Latitude || (location && location.lat) || 0;
+    const lng = Longitude || (location && location.lng) || 0;
 
-    // Update busLocations
-    if (lat != null && lng != null) {
-      lastBusState[readerUsername] = { lat, lng, speed: Speed || 0, heading: Heading || 0 };
-      const locData = {
-        Latitude: lat,
-        Longitude: lng,
-        Altitude: Altitude || null,
-        Speed: Speed || 0,
-        Heading: Heading || null,
-        Satellites: Satellites || null,
-        Date: dateStr || null,
-        "Time (UTC)": timeStr || null,
-        timestamp
-      };
+    const locData = {
+      Latitude: lat,
+      Longitude: lng,
+      Altitude: Altitude || null,
+      Speed: Speed || 0,
+      Heading: Heading || null,
+      Satellites: Satellites || null,
+      Date: dateStr || null,
+      "Time (UTC)": timeStr || null,
+      timestamp
+    };
 
+    if (tagId || emergency === true) {
       updates[`busLocations/${busKey}/current`] = locData;
       updates[`busLocations/${busKey}/history/${timestamp}`] = locData;
-      console.log(`Updated bus location for ${busKey}`);
+      console.log(`Updated bus location for ${busKey} (RFID or Emergency)`);
     }
 
     // Emergency handling
-    if (emergency === true && lat != null && lng != null) {
+    if (emergency === true) {
       await emergencyRef.child(readerUsername).set({
         readerUsername,
         emergency: true,
